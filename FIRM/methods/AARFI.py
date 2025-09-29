@@ -1,139 +1,242 @@
 import copy
+from typing import Dict, List, Tuple, Iterable
+import numpy as np
+
 from FIRM.base.ct_fuzzy_rule import CRFuzzyRule
 from FIRM.base.ct_fuzzy_antecedent import CRFuzzyAntecedent
 from FIRM.base.ct_set_fuzzy_rules import SetFuzzyRules
-def compatible_con(list_of_tuples, new_tuple):
-    """
-    Checks if a tuple is compatible to be the consequent of an antecedent of a rule.
-    """
-    x, y = new_tuple  # Unpack the new tuple
-    # Check if x is already present as the first component in any tuple in the list
-    if x not in [a for a, b in list_of_tuples]:
-        return True
-    else:
-        return False
 
-# Generate fuzzy 1-itemsets
-def generate_fuzzy_1itemsets(fuzzy_dataset):
-    """
-    Generate fuzzy itemsets by combining items with linguistic variables.
-    """
-    itemsets = []
-    for item in range(len(fuzzy_dataset.fv_list)):
-        for lv in range(len(fuzzy_dataset.fv_list[item].get_labels)):
-            itemsets.append([(item,lv)])
-    return itemsets
 
-def frequent_itemsets(itemsets,min_cov,dataset,fuzzy_dataset,T):
-    """
-    Given a list of itemsets, return only the frequent ones w.r.t a minimum coverage.
-    """
-    freq_itemsets = []
-    for itemset in itemsets:
-        antecedent = CRFuzzyAntecedent(itemset)
-        antecedent = antecedent.evaluate_rule_database(dataset,fuzzy_dataset,T)
-        if antecedent.fcoverage() >= min_cov:
-            freq_itemsets.append(itemset)
-    return freq_itemsets
+# ---------- helpers --------------------------------------------------------
 
-def generate_nitemsets(frequent_n_1_itemsets):
-    """
-    Generate n-itemsets from (n-1)-itemsets.
-    """
-    n = len(frequent_n_1_itemsets)
-    candidate_nitemsets = []
+def compatible_con(ant: Iterable[Tuple[int,int]], con: Tuple[int,int]) -> bool:
+    """A consequent must refer to a feature not already used in antecedent."""
+    ant_features = {i for (i, _) in ant}
+    return con[0] not in ant_features
 
-    # Join Step: Combine pairs of (n-1)-itemsets
+def _vectorize_binary(f):
+    def vf(a, b):
+        try:
+            return f(a, b)
+        except Exception:
+            return np.vectorize(f, otypes=[float])(a, b)
+    return vf
+
+
+# ---------- 1-itemsets & cache --------------------------------------------
+
+def generate_fuzzy_1itemsets(fuzzy_dataset) -> List[frozenset]:
+    """
+    Each item is a (feature_idx, ling_idx) tuple. Itemsets are frozensets of items.
+    """
+    out = []
+    for f_idx, fv in enumerate(fuzzy_dataset.fv_list):
+        for l_idx, _ in enumerate(fv.get_labels):
+            out.append(frozenset({(f_idx, l_idx)}))
+    return out
+
+def _precompute_singleton_memberships(dataset, fuzzy_dataset) -> Dict[Tuple[int,int], np.ndarray]:
+    """
+    Cache μ(x) vectors for every singleton (f,l) once.
+    """
+    cache: Dict[Tuple[int,int], np.ndarray] = {}
+    for f_idx, fv in enumerate(fuzzy_dataset.fv_list):
+        col = dataset.iloc[:, f_idx].to_numpy()
+        for l_idx, _ in enumerate(fv.get_labels):
+            mu = fv.fs_list[l_idx]
+            try:
+                v = mu(col).astype(np.float32)
+            except Exception:
+                v = np.fromiter((mu(x) for x in col), count=len(col), dtype=np.float32)
+            cache[(f_idx, l_idx)] = v
+    return cache
+
+
+# ---------- Frequent itemsets ---------------------------------------------
+
+def frequent_itemsets(
+    itemsets: List[frozenset],
+    min_cov: float,
+    singleton_mu: Dict[Tuple[int,int], np.ndarray],
+    T,  # binary t-norm accepting arrays
+) -> Tuple[List[frozenset], Dict[frozenset, np.ndarray]]:
+    """
+    Filter itemsets by fuzzy coverage and return their antecedent vectors.
+    Returns:
+      - list of frequent itemsets
+      - dict mapping itemset -> antecedent vector (μ reduced by T)
+    """
+    vT = _vectorize_binary(T)
+    ant_vecs: Dict[frozenset, np.ndarray] = {}
+    freq: List[frozenset] = []
+
+    for S in itemsets:
+        items = sorted(S)  # deterministic order
+        # reduce membership vectors via T
+        vec = singleton_mu[items[0]]
+        for it in items[1:]:
+            vec = vT(vec, singleton_mu[it])
+
+        cov = float(vec.mean())
+        if cov >= min_cov:
+            freq.append(S)
+            ant_vecs[S] = vec.astype(np.float32, copy=False)
+
+    return freq, ant_vecs
+
+
+def generate_nitemsets(prev_level: List[frozenset]) -> List[frozenset]:
+    """
+    Standard Apriori join: join L_{k-1} with itself to make C_k.
+    Also enforces no duplicate feature in an itemset.
+    """
+    Ck = set()
+    L = [sorted(s) for s in prev_level]
+    n = len(L)
     for i in range(n):
         for j in range(i + 1, n):
-            itemset1 = frequent_n_1_itemsets[i]
-            itemset2 = frequent_n_1_itemsets[j]
+            a, b = L[i], L[j]
+            # join if first k-2 items equal
+            if a[:-1] == b[:-1]:
+                cand = a[:-1] + sorted([a[-1], b[-1]])
+                # enforce unique feature indices
+                features = [fi for (fi, _) in cand]
+                if len(features) == len(set(features)):
+                    Ck.add(frozenset(cand))
+    return list(Ck)
 
-            # Check if the first (n-2) items are the same
-            if itemset1[:-1] == itemset2[:-1]:
-                candidate = sorted(itemset1 + [itemset2[-1]])
-                candidate_nitemsets.append(candidate)
 
-    return candidate_nitemsets
-
-def eliminate_candidates(candidates):
+def eliminate_by_apriori_property(candidates: List[frozenset], prev_level_set: set) -> List[frozenset]:
     """
-    Eliminates candidates that contain tuples of the type (x, y) and (x, z),
-    where y != z (same first component but different second components).
+    Prune C_k: every (k-1)-subset must be in L_{k-1}.
     """
-    valid_candidates = []
+    pruned = []
+    for c in candidates:
+        k = len(c)
+        ok = True
+        for it in c:
+            if frozenset(c - {it}) not in prev_level_set:
+                ok = False
+                break
+        if ok:
+            pruned.append(c)
+    return pruned
 
-    for candidate in candidates:
-        # Create a dictionary to track the first component (x) and its corresponding second component (y)
-        first_component_map = {}
-        is_valid = True
 
-        for x, y in candidate:
-            if x in first_component_map:
-                # If the first component (x) already exists, check if the second component (y) is the same
-                if first_component_map[x] != y:
-                    is_valid = False  # Invalid candidate, as it has (x, y) and (x, z) where y != z
-                    break
-            else:
-                # Store the first component and its corresponding second component
-                first_component_map[x] = y
+# ---------- Main Apriori ---------------------------------------------------
 
-        if is_valid:
-            valid_candidates.append(candidate)
-
-    return valid_candidates
-
-def apriori(dataset, fuzzy_dataset, T, min_cov = 0.1, max_feat = 5):
+def apriori(dataset, fuzzy_dataset, T, min_cov: float = 0.1, max_feat: int = 5):
     """
-    Generalized Apriori algorithm for the given fuzzy dataset.
-    Returns all frequent itemsets (from 1-itemsets to n-itemsets) as a list of lists.
+    Returns: (all_frequent_itemsets, antecedent_vectors)
+      - all_frequent_itemsets: list[frozenset]
+      - antecedent_vectors: dict[itemset -> np.ndarray] for quick reuse
     """
-    all_frequent_itemsets = []
+    singleton_mu = _precompute_singleton_memberships(dataset, fuzzy_dataset)
 
-    # Step 1: Generate frequent 1-itemsets
-    freq_itemsets_1 = frequent_itemsets(generate_fuzzy_1itemsets(fuzzy_dataset),min_cov,dataset,fuzzy_dataset,T)
-    all_frequent_itemsets.extend(freq_itemsets_1)
+    all_freq: List[frozenset] = []
+    ant_vectors: Dict[frozenset, np.ndarray] = {}
 
-    # Step 2: Iteratively generate frequent n-itemsets
-    n = 2
-    freq_itemsets_prev = freq_itemsets_1
-    while freq_itemsets_prev and n<=max_feat:
-        freq_itemsets_n = frequent_itemsets(eliminate_candidates(generate_nitemsets(freq_itemsets_prev)),min_cov,dataset,fuzzy_dataset,T)
-        if not freq_itemsets_n:
-            break  # Stop if no more frequent itemsets are found
-        all_frequent_itemsets.extend(freq_itemsets_n)
-        freq_itemsets_prev = freq_itemsets_n
-        n += 1
-    return all_frequent_itemsets
+    # L1
+    Lk, ant_k = frequent_itemsets(generate_fuzzy_1itemsets(fuzzy_dataset), min_cov, singleton_mu, T)
+    all_freq.extend(Lk)
+    ant_vectors.update(ant_k)
+
+    k = 2
+    while Lk and k <= max_feat:
+        # Ck
+        Ck = generate_nitemsets(Lk)
+        Ck = eliminate_by_apriori_property(Ck, set(Lk))
+
+        # evaluate Ck using cached singletons (reduce by T)
+        Lk, ant_k = frequent_itemsets(Ck, min_cov, singleton_mu, T)
+        all_freq.extend(Lk)
+        ant_vectors.update(ant_k)
+        k += 1
+
+    return all_freq, ant_vectors
+
+
+# ---------- Rule generation (AARFI) ---------------------------------------
 
 def AARFI(dataset, fuzzy_dataset, T, I, min_cov=0.3, min_supp=0.3, min_conf=0.8, max_feat=5):
-    rules = []
-    ant_candidates = apriori(dataset, fuzzy_dataset, T, min_cov, max_feat)
-    con_candidates = generate_fuzzy_1itemsets(fuzzy_dataset)
+    """
+    Generates association rules with fuzzy antecedents and singleton consequents.
+    Uses cached antecedent vectors from Apriori to avoid re-evaluation.
+    """
+    vT = _vectorize_binary(T)
+    vI = _vectorize_binary(I)
 
-    for con in con_candidates:
-        for ant in ant_candidates:
-            if compatible_con(ant, con[0]):
-                # make deep copies to avoid shared mutation
-                ant_copy = copy.deepcopy(ant)
-                con_copy = copy.deepcopy(con)
-                rule = CRFuzzyRule(ant_copy + con_copy)
-                rule = rule.evaluate_rule_database(dataset, fuzzy_dataset, T, I)
-                if rule.fsupport() >= min_supp and rule.fconfidence() >= min_conf:
-                    rules.append(rule)
+    # Mine antecedent candidates and get their vectors
+    ant_candidates, ant_vecs = apriori(dataset, fuzzy_dataset, T, min_cov, max_feat)
+
+    # Precompute all singleton consequents' vectors once
+    singleton_mu = _precompute_singleton_memberships(dataset, fuzzy_dataset)
+    con_candidates = [next(iter(s)) for s in generate_fuzzy_1itemsets(fuzzy_dataset)]  # list of (f,l)
+
+    rules = []
+    for ant in ant_candidates:
+        ant_vec = ant_vecs[ant]
+        sum_ant = float(ant_vec.sum())
+        if sum_ant == 0.0:
+            continue
+
+        ant_features = {fi for (fi, _) in ant}
+
+        for con in con_candidates:
+            if con[0] in ant_features:
+                continue  # respect compatibility
+
+            con_vec = singleton_mu[con]
+            implied = vI(ant_vec, con_vec)
+            eval_vec = vT(ant_vec, implied)
+
+            fsupport = float(eval_vec.mean())
+            if fsupport < min_supp:
+                continue
+
+            fconfidence = float(eval_vec.sum() / sum_ant)
+            if fconfidence < min_conf:
+                continue
+
+            # Build the full rule object (vectorized evaluate to fill fields if you prefer)
+            lrule = sorted(ant) + [con]
+            rule = CRFuzzyRule(lrule)
+            # Use CRFuzzyRule's vectorized evaluation with membership cache to avoid recomputation
+            # If your CRFuzzyRule supports cache injection, pass it; else this call will re-evaluate.
+            rule.evaluate_rule_database(dataset, fuzzy_dataset, T, I)
+            rules.append(rule)
+
     return SetFuzzyRules(rules)
 
-def redundacy_prunning(rules, epsilon = 0.05):
-    rules =  rules.rule_list
-    result = []
-    for i, rule1 in enumerate(rules):
-        is_subset = False
-        for j, rule2 in enumerate(rules):
-            if i != j and rule2.lrule[-1] == rule1.lrule[-1] and set(rule2.lrule[:-1]).issubset(
-                    set(rule1.lrule[:-1])) and abs(rule1.fconfidence() - rule2.fconfidence()) < epsilon:
-                is_subset = True
-                break
-        if not is_subset:
-            result.append(rule1)
 
-    return redundacy_prunning(SetFuzzyRules(result))
+# ---------- Redundancy pruning --------------------------------------------
+
+def redundancy_pruning(rules: SetFuzzyRules, epsilon: float = 0.05) -> SetFuzzyRules:
+    """
+    Remove rules whose antecedent is a superset of another rule's antecedent
+    with the same consequent and nearly equal confidence.
+    """
+    by_con: Dict[Tuple[int,int], List[CRFuzzyRule]] = {}
+    for r in rules.rule_list:
+        con = r.lrule[-1]
+        by_con.setdefault(con, []).append(r)
+
+    kept: List[CRFuzzyRule] = []
+    for con, group in by_con.items():
+        # sort by antecedent size ascending to prefer keeping shorter rules
+        group_sorted = sorted(group, key=lambda r: len(r.lrule) - 1)
+        selected: List[CRFuzzyRule] = []
+        for i, r1 in enumerate(group_sorted):
+            A1 = set(r1.lrule[:-1])
+            c1 = r1.fconfidence()
+            redundant = False
+            for r2 in selected:  # only compare to already kept (smaller) ones
+                A2 = set(r2.lrule[:-1])
+                if A2.issubset(A1) and abs(c1 - r2.fconfidence()) < epsilon:
+                    redundant = True
+                    break
+            if not redundant:
+                selected.append(r1)
+        kept.extend(selected)
+
+    return SetFuzzyRules(kept)
