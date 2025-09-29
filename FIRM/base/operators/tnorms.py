@@ -29,7 +29,7 @@ class TnormsExamples(Enum):
 
     @staticmethod
     def minimum_tnorm(x: float, y: float) -> float:
-        return np.minimum(x, y)
+        return min(x, y)
 
     @staticmethod
     def product_tnorm(x: float, y: float) -> float:
@@ -40,7 +40,7 @@ class TnormsExamples(Enum):
         if x == 0 or y == 0:
             return 0
         else:
-            return (np.maximum(x ** mu + y ** mu - 1, 0)) ** (1 / mu)
+            return (max(x ** mu + y ** mu - 1, 0)) ** (1 / mu)
 
     @staticmethod
     def h_tnorm(x: float, y: float, mu: float) -> float:
@@ -58,4 +58,4 @@ class TnormsExamples(Enum):
         if x == 0 or y == 0:
             return 0
         else:
-            return np.maximum(0, x + y - 1)
+            return max(0, x + y - 1)

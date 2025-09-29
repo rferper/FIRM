@@ -121,7 +121,7 @@ class FuzzyRule(object):
         out.append(labels[int(np.nonzero(self.brule[-1])[0])])
         return ' '.join(out)
 
-    def measures(self, I):
+    def measures(self):
         out = pd.DataFrame(columns=['nfeatures',
                                     'fcoverage',
                                     'fsupport',

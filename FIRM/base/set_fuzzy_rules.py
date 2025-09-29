@@ -18,7 +18,7 @@ class SetFuzzyRules(object):
     def __init__(self, rule_list=[]):
         self.rule_list = rule_list
 
-    def measures(self, I, fuzzy_dataset):
+    def measures(self, fuzzy_dataset):
         out = pd.DataFrame(columns=['sentence_rule',
                                     'num_features',
                                     'fcoverage',
@@ -27,7 +27,7 @@ class SetFuzzyRules(object):
                                     'fwracc'])
         out['sentence_rule'] = list(map(lambda x: fuzzy_rule.FuzzyRule.sentence_rule(x, fuzzy_dataset), self.rule_list))
         for i in range(len(self.rule_list)):
-            measures = self.rule_list[i].measures(I)
+            measures = self.rule_list[i].measures()
             out.iloc[i, 1:] = measures.values[0]
         return out
 

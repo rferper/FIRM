@@ -1,4 +1,4 @@
-
+import copy
 from FIRM.base.ct_fuzzy_rule import CRFuzzyRule
 from FIRM.base.ct_fuzzy_antecedent import CRFuzzyAntecedent
 from FIRM.base.ct_set_fuzzy_rules import SetFuzzyRules
@@ -106,19 +106,22 @@ def apriori(dataset, fuzzy_dataset, T, min_cov = 0.1, max_feat = 5):
         n += 1
     return all_frequent_itemsets
 
-def AARFI(dataset, fuzzy_dataset, T, I, min_cov = 0.3, min_supp = 0.3, min_conf = 0.8, max_feat = 5):
+def AARFI(dataset, fuzzy_dataset, T, I, min_cov=0.3, min_supp=0.3, min_conf=0.8, max_feat=5):
     rules = []
     ant_candidates = apriori(dataset, fuzzy_dataset, T, min_cov, max_feat)
     con_candidates = generate_fuzzy_1itemsets(fuzzy_dataset)
+
     for con in con_candidates:
         for ant in ant_candidates:
             if compatible_con(ant, con[0]):
-                rule = CRFuzzyRule(ant + con)
+                # make deep copies to avoid shared mutation
+                ant_copy = copy.deepcopy(ant)
+                con_copy = copy.deepcopy(con)
+                rule = CRFuzzyRule(ant_copy + con_copy)
                 rule = rule.evaluate_rule_database(dataset, fuzzy_dataset, T, I)
                 if rule.fsupport() >= min_supp and rule.fconfidence() >= min_conf:
                     rules.append(rule)
-    rules = SetFuzzyRules(rules)
-    return rules
+    return SetFuzzyRules(rules)
 
 def redundacy_prunning(rules, epsilon = 0.05):
     rules =  rules.rule_list
