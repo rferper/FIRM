@@ -71,7 +71,7 @@ class FuzzyDataUniformTriangular(FuzzyData):
         fv_list = []
         for name_v in names_variables:
             variable = dataset[name_v]
-            if variable.dtype == float:
+            if variable.dtype == float or variable.dtype == int:
                 fv_list.append(fuzzy_linguistic_variable.UniformTriangle(name=name_v, n_sets=n_labels,
                                                                          labels=labels,
                                                                          universe_of_discourse=[
@@ -89,7 +89,7 @@ class FuzzyDataCMeans(FuzzyData):
         fv_list = []
         for name_v in names_variables:
             variable = dataset[name_v]
-            if variable.dtype == float:
+            if variable.dtype == float or variable.dtype == int:
                 part = CMeans.CMeansPartitioner(data=variable, npart=n_labels, func=mf.trimf)
                 keys = list(part.sets.keys())
                 fs_list = []
@@ -128,7 +128,7 @@ class FuzzyDataFCM(FuzzyData):
         fv_list = []
         for name_v in names_variables:
             variable = dataset[name_v]
-            if variable.dtype == float:
+            if variable.dtype == float or variable.dtype == int:
                 part = FCM.FCMPartitioner(data=variable, npart=n_labels, func=mf.trimf)
                 keys = list(part.sets.keys())
                 fs_list = []
@@ -167,7 +167,7 @@ class FuzzyDataEntropy(FuzzyData):
         fv_list = []
         for name_v in names_variables:
             variable = dataset[name_v]
-            if variable.dtype == float:
+            if variable.dtype == float or variable.dtype == int:
                 part = Entropy.EntropyPartitioner(data=variable, npart=n_labels, func=mf.trimf)
                 keys = list(part.sets.keys())
                 fs_list = []
@@ -206,7 +206,7 @@ class FuzzyDataHuarng(FuzzyData):
         fv_list = []
         for name_v in names_variables:
             variable = dataset[name_v]
-            if variable.dtype == float:
+            if variable.dtype == float or variable.dtype == int:
                 part = Huarng.HuarngPartitioner(data=variable, npart=n_labels, func=mf.trimf)
                 keys = list(part.sets.keys())
                 fs_list = []
@@ -246,7 +246,7 @@ class FuzzyDataQuantiles(FuzzyData):
         fv_list = []
         for name_v in names_variables:
             variable = dataset[name_v]
-            if variable.dtype == float:
+            if variable.dtype == float or variable.dtype == int:
                 parameters = [np.quantile(variable, 1 / (n_labels + 1) * a) for a in range(0, n_labels + 2)]
                 fs_list = []
                 fs_list.append(fuzzy_set.FuzzySet(membership_function.TrapezoidalMF(a=parameters[0],
