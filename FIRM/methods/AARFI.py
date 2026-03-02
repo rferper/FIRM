@@ -151,13 +151,16 @@ def generate_nitemsets(
     *,
     verbose: bool = False,
     logger: Optional[logging.Logger] = None,
-) -> List[frozenset]:
+) -> Tuple[List[frozenset], Dict[frozenset, Tuple[frozenset, Tuple[int,int]]]]:
     """
     Standard Apriori join: join L_{k-1} with itself to make C_k.
     Also enforces no duplicate feature in an itemset.
+    Returns candidates and an incremental construction map:
+      candidate -> (parent_(k-1)-itemset, added_singleton_item)
     """
     lg = _get_logger(logger, verbose)
     Ck = set()
+    parent_map: Dict[frozenset, Tuple[frozenset, Tuple[int,int]]] = {}
     L = [sorted(s) for s in prev_level]
     n = len(L)
     for i in range(n):
@@ -169,10 +172,50 @@ def generate_nitemsets(
                 # enforce unique feature indices
                 features = [fi for (fi, _) in cand]
                 if len(features) == len(set(features)):
-                    Ck.add(frozenset(cand))
+                    cand_fs = frozenset(cand)
+                    Ck.add(cand_fs)
+                    # Incremental vector construction:
+                    # cand = parent + singleton_added_item
+                    parent_map.setdefault(cand_fs, (frozenset(a), b[-1]))
     out = list(Ck)
     _vlog(verbose, lg, "Joined %d -> %d candidates for next level.", len(prev_level), len(out))
-    return out
+    return out, parent_map
+
+
+def frequent_itemsets_incremental(
+    candidates: List[frozenset],
+    parent_map: Dict[frozenset, Tuple[frozenset, Tuple[int,int]]],
+    min_cov: float,
+    prev_ant_vecs: Dict[frozenset, np.ndarray],
+    singleton_mu: Dict[Tuple[int,int], np.ndarray],
+    T,
+    *,
+    verbose: bool = False,
+    logger: Optional[logging.Logger] = None,
+) -> Tuple[List[frozenset], Dict[frozenset, np.ndarray]]:
+    """
+    Evaluate C_k incrementally from L_{k-1} vectors:
+      vec(cand) = T(vec(parent), mu(added_item))
+    """
+    lg = _get_logger(logger, verbose)
+    vT = _vectorize_binary(T)
+    ant_vecs: Dict[frozenset, np.ndarray] = {}
+    freq: List[frozenset] = []
+
+    _vlog(verbose, lg, "Evaluating %d candidates incrementally (min_cov=%.4f)...",
+          len(candidates), min_cov)
+
+    for S in candidates:
+        parent, add_item = parent_map[S]
+        vec = vT(prev_ant_vecs[parent], singleton_mu[add_item])
+        cov = float(vec.mean())
+        if cov >= min_cov:
+            freq.append(S)
+            ant_vecs[S] = vec.astype(np.float32, copy=False)
+
+    _vlog(verbose, lg, "Incremental selection: %d frequent itemsets (%.1f%% pass rate).",
+          len(freq), 100.0 * len(freq) / max(1, len(candidates)))
+    return freq, ant_vecs
 
 
 def eliminate_by_apriori_property(
@@ -211,6 +254,7 @@ def apriori(
     T,
     min_cov: float = 0.1,
     max_feat: int = 5,
+    singleton_mu: Optional[Dict[Tuple[int,int], np.ndarray]] = None,
     *,
     verbose: bool = False,
     logger: Optional[logging.Logger] = None,
@@ -223,9 +267,12 @@ def apriori(
     lg = _get_logger(logger, verbose)
     _vlog(verbose, lg, "Starting Apriori (min_cov=%.4f, max_feat=%d)...", min_cov, max_feat)
 
-    singleton_mu = _precompute_singleton_memberships(
-        dataset, fuzzy_dataset, verbose=verbose, logger=lg
-    )
+    if singleton_mu is None:
+        singleton_mu = _precompute_singleton_memberships(
+            dataset, fuzzy_dataset, verbose=verbose, logger=lg
+        )
+    else:
+        _vlog(verbose, lg, "Using precomputed singleton memberships (%d vectors).", len(singleton_mu))
 
     all_freq: List[frozenset] = []
     ant_vectors: Dict[frozenset, np.ndarray] = {}
@@ -241,11 +288,22 @@ def apriori(
     while Lk and k <= max_feat:
         _vlog(verbose, lg, "---- Level %d ----", k)
         # Ck
-        Ck = generate_nitemsets(Lk, verbose=verbose, logger=lg)
+        Ck, parent_map = generate_nitemsets(Lk, verbose=verbose, logger=lg)
         Ck = eliminate_by_apriori_property(Ck, set(Lk), verbose=verbose, logger=lg)
+        parent_map = {c: parent_map[c] for c in Ck}
 
-        # evaluate Ck using cached singletons (reduce by T)
-        Lk, ant_k = frequent_itemsets(Ck, min_cov, singleton_mu, T, verbose=verbose, logger=lg)
+        # Evaluate Ck incrementally from previous level vectors.
+        prev_ant_k = ant_k
+        Lk, ant_k = frequent_itemsets_incremental(
+            Ck,
+            parent_map,
+            min_cov,
+            prev_ant_k,
+            singleton_mu,
+            T,
+            verbose=verbose,
+            logger=lg,
+        )
         _vlog(verbose, lg, "Level-%d frequent itemsets: %d", k, len(Lk))
         all_freq.extend(Lk)
         ant_vectors.update(ant_k)
@@ -253,6 +311,109 @@ def apriori(
 
     _vlog(verbose, lg, "Apriori finished: total frequent itemsets = %d", len(all_freq))
     return all_freq, ant_vectors
+
+
+def beam_apriori(
+    dataset,
+    fuzzy_dataset,
+    T,
+    min_cov: float = 0.1,
+    max_feat: int = 5,
+    beam_width: int = 128,
+    max_children_per_node: int = 32,
+    singleton_mu: Optional[Dict[Tuple[int,int], np.ndarray]] = None,
+    score_fn: Optional[Callable[[float, int], float]] = None,
+    *,
+    verbose: bool = False,
+    logger: Optional[logging.Logger] = None,
+) -> Tuple[List[frozenset], Dict[frozenset, np.ndarray]]:
+    """
+    Beam-search heuristic over antecedent itemsets.
+
+    Keeps only the top `beam_width` candidates per level using:
+      score(cov, k) = cov + 0.01 * k  (default)
+    where cov is fuzzy coverage and k is antecedent size.
+    """
+    lg = _get_logger(logger, verbose)
+    vT = _vectorize_binary(T)
+    if score_fn is None:
+        score_fn = lambda cov, k: cov + 0.01 * float(k)
+
+    if singleton_mu is None:
+        singleton_mu = _precompute_singleton_memberships(
+            dataset, fuzzy_dataset, verbose=verbose, logger=lg
+        )
+
+    one_items = [next(iter(s)) for s in generate_fuzzy_1itemsets(
+        fuzzy_dataset, verbose=verbose, logger=lg
+    )]
+
+    # Level 1
+    L1_candidates = [frozenset({it}) for it in one_items]
+    L1, ant1 = frequent_itemsets(
+        L1_candidates, min_cov, singleton_mu, T, verbose=verbose, logger=lg
+    )
+    if not L1:
+        return [], {}
+
+    scored_l1 = sorted(
+        ((score_fn(float(ant1[s].mean()), 1), s) for s in L1),
+        key=lambda x: x[0],
+        reverse=True,
+    )
+    beam_level = [s for _, s in scored_l1[:max(1, beam_width)]]
+
+    selected: List[frozenset] = list(beam_level)
+    ant_vectors: Dict[frozenset, np.ndarray] = {s: ant1[s] for s in beam_level}
+    _vlog(verbose, lg, "Beam level 1: kept %d itemsets.", len(beam_level))
+
+    k = 2
+    while beam_level and k <= max_feat:
+        _vlog(verbose, lg, "---- Beam level %d ----", k)
+
+        cand_vecs: Dict[frozenset, np.ndarray] = {}
+        for parent in beam_level:
+            parent_vec = ant_vectors[parent]
+            parent_items = sorted(parent)
+            parent_features = {fi for (fi, _) in parent_items}
+            parent_last = parent_items[-1]
+
+            child_count = 0
+            for add_item in one_items:
+                if add_item[0] in parent_features:
+                    continue
+                # Enforce lexicographic growth to avoid duplicates.
+                if add_item <= parent_last:
+                    continue
+                child = frozenset(parent | {add_item})
+                if child in cand_vecs:
+                    continue
+                vec = vT(parent_vec, singleton_mu[add_item]).astype(np.float32, copy=False)
+                cov = float(vec.mean())
+                if cov >= min_cov:
+                    cand_vecs[child] = vec
+                    child_count += 1
+                    if max_children_per_node > 0 and child_count >= max_children_per_node:
+                        break
+
+        if not cand_vecs:
+            break
+
+        scored = sorted(
+            ((score_fn(float(v.mean()), k), s) for s, v in cand_vecs.items()),
+            key=lambda x: x[0],
+            reverse=True,
+        )
+        beam_level = [s for _, s in scored[:max(1, beam_width)]]
+
+        for s in beam_level:
+            ant_vectors[s] = cand_vecs[s]
+        selected.extend(beam_level)
+        _vlog(verbose, lg, "Beam level %d: candidates=%d kept=%d.", k, len(cand_vecs), len(beam_level))
+        k += 1
+
+    _vlog(verbose, lg, "Beam Apriori finished: selected antecedents=%d", len(selected))
+    return selected, ant_vectors
 
 
 # ---------- Rule generation (AARFI) ---------------------------------------
@@ -266,6 +427,7 @@ def AARFI(
     min_supp=0.3,
     min_conf=0.8,
     max_feat=5,
+    con_chunk: int = 64,
     *,
     verbose: bool = False,
     logger: Optional[logging.Logger] = None,
@@ -279,23 +441,37 @@ def AARFI(
     vI = _vectorize_binary(I)
 
     _vlog(verbose, lg,
-          "AARFI start (min_cov=%.3f, min_supp=%.3f, min_conf=%.3f, max_feat=%d)...",
-          min_cov, min_supp, min_conf, max_feat)
+          "AARFI start (min_cov=%.3f, min_supp=%.3f, min_conf=%.3f, max_feat=%d, con_chunk=%d)...",
+          min_cov, min_supp, min_conf, max_feat, con_chunk)
 
-    # Mine antecedent candidates and get their vectors
-    ant_candidates, ant_vecs = apriori(
-        dataset, fuzzy_dataset, T, min_cov, max_feat, verbose=verbose, logger=lg
-    )
-    _vlog(verbose, lg, "Antecedent candidates: %d", len(ant_candidates))
-
-    # Precompute all singleton consequents' vectors once
+    # Precompute singleton memberships once and reuse in Apriori + consequents.
     singleton_mu = _precompute_singleton_memberships(
         dataset, fuzzy_dataset, verbose=verbose, logger=lg
     )
+
+    # Mine antecedent candidates and get their vectors
+    ant_candidates, ant_vecs = apriori(
+        dataset,
+        fuzzy_dataset,
+        T,
+        min_cov,
+        max_feat,
+        singleton_mu=singleton_mu,
+        verbose=verbose,
+        logger=lg,
+    )
+    _vlog(verbose, lg, "Antecedent candidates: %d", len(ant_candidates))
+
+    # Build all singleton consequents once
     con_candidates = [next(iter(s)) for s in generate_fuzzy_1itemsets(
         fuzzy_dataset, verbose=verbose, logger=lg
     )]  # list of (f,l)
     _vlog(verbose, lg, "Consequent candidates (singletons): %d", len(con_candidates))
+    C = np.stack([singleton_mu[c] for c in con_candidates], axis=1).astype(np.float32, copy=False)
+    con_feat_idx = np.array([c[0] for c in con_candidates], dtype=np.int32)
+    n_cons = C.shape[1]
+    if not con_chunk or con_chunk <= 0:
+        con_chunk = n_cons
 
     rules = []
     examined = 0
@@ -307,34 +483,38 @@ def AARFI(
             continue
 
         ant_features = {fi for (fi, _) in ant}
+        compatible = np.nonzero(~np.isin(con_feat_idx, list(ant_features)))[0]
+        examined += int(compatible.size)
+        if compatible.size == 0:
+            continue
 
-        for con in con_candidates:
-            if con[0] in ant_features:
-                continue  # respect compatibility
+        a_col = ant_vec[:, None]
+        for s in range(0, compatible.size, con_chunk):
+            e = min(s + con_chunk, compatible.size)
+            idx_blk = compatible[s:e]
+            C_blk = C[:, idx_blk]
 
-            con_vec = singleton_mu[con]
-            implied = vI(ant_vec, con_vec)
-            eval_vec = vT(ant_vec, implied)
+            implied_blk = vI(a_col, C_blk)
+            eval_blk = vT(a_col, implied_blk).astype(np.float32, copy=False)
 
-            fsupport = float(eval_vec.mean())
-            if fsupport < min_supp:
-                examined += 1
+            fsupport_blk = eval_blk.mean(axis=0)
+            fconfidence_blk = eval_blk.sum(axis=0) / sum_ant
+            ok = (fsupport_blk >= min_supp) & (fconfidence_blk >= min_conf)
+            if not np.any(ok):
                 continue
 
-            fconfidence = float(eval_vec.sum() / sum_ant)
-            if fconfidence < min_conf:
-                examined += 1
-                continue
-
-            # Build the full rule object (vectorized evaluate to fill fields if you prefer)
-            lrule = sorted(ant) + [con]
-            rule = CRFuzzyRule(lrule)
-            # Use CRFuzzyRule's vectorized evaluation with membership cache to avoid recomputation
-            # If your CRFuzzyRule supports cache injection, pass it; else this call will re-evaluate.
-            rule.evaluate_rule_database(dataset, fuzzy_dataset, T, I)
-            rules.append(rule)
-            kept += 1
-            examined += 1
+            for pos in np.nonzero(ok)[0].tolist():
+                j = int(idx_blk[pos])
+                con = con_candidates[j]
+                lrule = sorted(ant) + [con]
+                rule = CRFuzzyRule(lrule)
+                # Reuse already computed vectors instead of evaluating the whole rule again.
+                rule.antecedents = ant_vec
+                rule.consequents = C[:, j]
+                rule.evaluations = eval_blk[:, pos]
+                rule.evaluated = 1
+                rules.append(rule)
+                kept += 1
 
     _vlog(verbose, lg, "AARFI finished. Rules kept: %d (from %d evaluated pairs).", kept, examined)
     return SetFuzzyRules(rules)
@@ -414,17 +594,24 @@ def AARFI_F(
           "AARFI_F (min_cov=%.3f, min_supp=%.3f, min_conf=%.3f, max_feat=%d)",
           min_cov, min_supp, min_conf, max_feat)
 
-    # ---- 1) Mine antecedents and reuse cached vectors from Apriori ----
+    # ---- 1) Precompute singleton memberships once, and mine antecedents ----
+    singleton_mu = _precompute_singleton_memberships(
+        dataset, fuzzy_dataset, verbose=verbose, logger=lg
+    )
     ant_list, ant_vecs = apriori(
-        dataset, fuzzy_dataset, T, min_cov, max_feat, verbose=verbose, logger=lg
+        dataset,
+        fuzzy_dataset,
+        T,
+        min_cov,
+        max_feat,
+        singleton_mu=singleton_mu,
+        verbose=verbose,
+        logger=lg,
     )
     if not ant_list:
         return SetFuzzyRules([]), pd.DataFrame(columns=["rule","coverage","support","confidence","lrule","n_antecedents"])
 
     # ---- 2) Stack all singleton consequents once: C shape (N, Cn) ----
-    singleton_mu = _precompute_singleton_memberships(
-        dataset, fuzzy_dataset, verbose=verbose, logger=lg
-    )
     con_items = [next(iter(s)) for s in generate_fuzzy_1itemsets(
         fuzzy_dataset, verbose=verbose, logger=lg
     )]
@@ -494,6 +681,133 @@ def AARFI_F(
           kept_pairs, examined_pairs)
 
     # Build DataFrame and sort for nicer presentation
+    if rows:
+        df = pd.DataFrame(rows)
+        df = df.sort_values(["confidence","support","coverage"], ascending=False, kind="mergesort").reset_index(drop=True)
+    else:
+        df = pd.DataFrame(columns=["rule","coverage","support","confidence","lrule","n_antecedents"])
+
+    return SetFuzzyRules(rule_objs), df
+
+
+def ARFI_beam(
+    dataset,
+    fuzzy_dataset,
+    T,
+    I,
+    F: Callable[[np.ndarray, np.ndarray], np.ndarray],
+    *,
+    min_cov: float = 0.3,
+    min_supp: float = 0.3,
+    min_conf: float = 0.8,
+    max_feat: int = 5,
+    beam_width: int = 128,
+    max_children_per_node: int = 32,
+    chunk_rows: int = 100_000,
+    score_fn: Optional[Callable[[float, int], float]] = None,
+    verbose: bool = False,
+    logger: Optional[logging.Logger] = None,
+) -> Tuple[SetFuzzyRules, pd.DataFrame]:
+    """
+    Beam-search version focused on speed for large datasets.
+
+    Output format matches AARFI_F:
+      - SetFuzzyRules (un-evaluated rule objects)
+      - DataFrame columns: ['rule','coverage','support','confidence','lrule','n_antecedents']
+    """
+    lg = _get_logger(logger, verbose)
+    _vlog(
+        verbose,
+        lg,
+        "ARFI_beam (min_cov=%.3f, min_supp=%.3f, min_conf=%.3f, max_feat=%d, beam_width=%d, max_children_per_node=%d)",
+        min_cov,
+        min_supp,
+        min_conf,
+        max_feat,
+        beam_width,
+        max_children_per_node,
+    )
+
+    singleton_mu = _precompute_singleton_memberships(
+        dataset, fuzzy_dataset, verbose=verbose, logger=lg
+    )
+    ant_list, ant_vecs = beam_apriori(
+        dataset,
+        fuzzy_dataset,
+        T,
+        min_cov=min_cov,
+        max_feat=max_feat,
+        beam_width=beam_width,
+        max_children_per_node=max_children_per_node,
+        singleton_mu=singleton_mu,
+        score_fn=score_fn,
+        verbose=verbose,
+        logger=lg,
+    )
+    if not ant_list:
+        return SetFuzzyRules([]), pd.DataFrame(columns=["rule","coverage","support","confidence","lrule","n_antecedents"])
+
+    con_items = [next(iter(s)) for s in generate_fuzzy_1itemsets(
+        fuzzy_dataset, verbose=verbose, logger=lg
+    )]
+    C = np.stack([singleton_mu[c] for c in con_items], axis=1).astype(np.float32, copy=False)
+    N, Cn = C.shape
+    con_feat_idx = np.array([c[0] for c in con_items], dtype=np.int32)
+
+    if not chunk_rows or chunk_rows <= 0:
+        chunk_rows = N
+
+    rows = []
+    rule_objs: List[CRFuzzyRule] = []
+    examined_pairs = 0
+    kept_pairs = 0
+
+    for ant in ant_list:
+        a = ant_vecs[ant].astype(np.float32, copy=False)
+        sum_a = float(a.sum()) + 1e-12
+        coverage_a = float(a.mean())
+
+        ant_features = {fi for (fi, _) in ant}
+        mask_feat = ~np.isin(con_feat_idx, list(ant_features))
+        if not np.any(mask_feat):
+            continue
+
+        numerators = np.zeros(Cn, dtype=np.float64)
+        for s in range(0, N, chunk_rows):
+            e = min(s + chunk_rows, N)
+            a_blk = a[s:e][:, None]
+            C_blk = C[s:e, :]
+            blk = F(a_blk, C_blk)
+            numerators += blk.sum(axis=0, dtype=np.float64)
+
+        fsupport_all = (numerators / float(N)).astype(np.float32, copy=False)
+        fconf_all = (numerators / sum_a).astype(np.float32, copy=False)
+
+        ok = mask_feat & (fsupport_all >= min_supp) & (fconf_all >= min_conf)
+        examined_pairs += int(mask_feat.sum())
+        if not np.any(ok):
+            continue
+
+        idxs = np.nonzero(ok)[0]
+        for j in idxs.tolist():
+            lrule = sorted(ant) + [con_items[j]]
+            r = CRFuzzyRule(lrule)
+            rule_str = r.sentence_rule(fuzzy_dataset)
+            rows.append({
+                "rule": rule_str,
+                "coverage": coverage_a,
+                "support": float(fsupport_all[j]),
+                "confidence": float(fconf_all[j]),
+                "lrule": tuple(lrule),
+                "n_antecedents": r.get_num_features(),
+            })
+            rule_objs.append(r)
+
+        kept_pairs += len(idxs)
+
+    _vlog(verbose, lg, "ARFI_beam finished. Rules kept: %d (from %d examined pairs).",
+          kept_pairs, examined_pairs)
+
     if rows:
         df = pd.DataFrame(rows)
         df = df.sort_values(["confidence","support","coverage"], ascending=False, kind="mergesort").reset_index(drop=True)
