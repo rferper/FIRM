@@ -428,6 +428,7 @@ def AARFI(
     min_conf=0.8,
     max_feat=5,
     con_chunk: int = 64,
+    prune_epsilon: float = 0.05,
     *,
     verbose: bool = False,
     logger: Optional[logging.Logger] = None,
@@ -517,7 +518,13 @@ def AARFI(
                 kept += 1
 
     _vlog(verbose, lg, "AARFI finished. Rules kept: %d (from %d evaluated pairs).", kept, examined)
-    return SetFuzzyRules(rules)
+    pruned = redundancy_pruning(
+        SetFuzzyRules(rules),
+        epsilon=prune_epsilon,
+        verbose=verbose,
+        logger=lg,
+    )
+    return pruned
 
 
 # ---------- Redundancy pruning --------------------------------------------
@@ -525,6 +532,7 @@ def AARFI(
 def redundancy_pruning(
     rules: SetFuzzyRules,
     epsilon: float = 0.05,
+    confidence_map: Optional[Dict[Tuple[int,int], float]] = None,
     *,
     verbose: bool = False,
     logger: Optional[logging.Logger] = None,
@@ -532,6 +540,8 @@ def redundancy_pruning(
     """
     Remove rules whose antecedent is a superset of another rule's antecedent
     with the same consequent and nearly equal confidence.
+    If confidence_map is provided, it is used instead of r.fconfidence().
+    The map must be keyed by tuple(r.lrule).
     """
     lg = _get_logger(logger, verbose)
     _vlog(verbose, lg, "Redundancy pruning (epsilon=%.4f) over %d rules...", epsilon, len(rules.rule_list))
@@ -549,11 +559,18 @@ def redundancy_pruning(
         selected: List[CRFuzzyRule] = []
         for i, r1 in enumerate(group_sorted):
             A1 = set(r1.lrule[:-1])
-            c1 = r1.fconfidence()
+            if confidence_map is not None:
+                c1 = float(confidence_map.get(tuple(r1.lrule), r1.fconfidence()))
+            else:
+                c1 = r1.fconfidence()
             redundant = False
             for r2 in selected:  # only compare to already kept (smaller) ones
                 A2 = set(r2.lrule[:-1])
-                if A2.issubset(A1) and abs(c1 - r2.fconfidence()) < epsilon:
+                if confidence_map is not None:
+                    c2 = float(confidence_map.get(tuple(r2.lrule), r2.fconfidence()))
+                else:
+                    c2 = r2.fconfidence()
+                if A2.issubset(A1) and abs(c1 - c2) < epsilon:
                     redundant = True
                     break
             if not redundant:
@@ -578,6 +595,7 @@ def AARFI_F(
     min_conf: float = 0.8,
     max_feat: int = 5,
     chunk_rows: int = 100_000,  # set 0/None to process all rows at once
+    prune_epsilon: float = 0.05,
     verbose: bool = False,
     logger: Optional[logging.Logger] = None,
 ) -> Tuple[SetFuzzyRules, pd.DataFrame]:
@@ -687,7 +705,18 @@ def AARFI_F(
     else:
         df = pd.DataFrame(columns=["rule","coverage","support","confidence","lrule","n_antecedents"])
 
-    return SetFuzzyRules(rule_objs), df
+    conf_map = {tuple(lr): float(c) for lr, c in zip(df["lrule"], df["confidence"])} if not df.empty else None
+    pruned = redundancy_pruning(
+        SetFuzzyRules(rule_objs),
+        epsilon=prune_epsilon,
+        confidence_map=conf_map,
+        verbose=verbose,
+        logger=lg,
+    )
+    if not df.empty:
+        kept_lrules = {tuple(r.lrule) for r in pruned.rule_list}
+        df = df[df["lrule"].isin(kept_lrules)].reset_index(drop=True)
+    return pruned, df
 
 
 def ARFI_beam(
@@ -705,6 +734,7 @@ def ARFI_beam(
     max_children_per_node: int = 32,
     chunk_rows: int = 100_000,
     score_fn: Optional[Callable[[float, int], float]] = None,
+    prune_epsilon: float = 0.05,
     verbose: bool = False,
     logger: Optional[logging.Logger] = None,
 ) -> Tuple[SetFuzzyRules, pd.DataFrame]:
@@ -814,7 +844,18 @@ def ARFI_beam(
     else:
         df = pd.DataFrame(columns=["rule","coverage","support","confidence","lrule","n_antecedents"])
 
-    return SetFuzzyRules(rule_objs), df
+    conf_map = {tuple(lr): float(c) for lr, c in zip(df["lrule"], df["confidence"])} if not df.empty else None
+    pruned = redundancy_pruning(
+        SetFuzzyRules(rule_objs),
+        epsilon=prune_epsilon,
+        confidence_map=conf_map,
+        verbose=verbose,
+        logger=lg,
+    )
+    if not df.empty:
+        kept_lrules = {tuple(r.lrule) for r in pruned.rule_list}
+        df = df[df["lrule"].isin(kept_lrules)].reset_index(drop=True)
+    return pruned, df
 
 
 
