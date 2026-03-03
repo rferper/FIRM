@@ -714,8 +714,11 @@ def AARFI_F(
         logger=lg,
     )
     if not df.empty:
-        kept_lrules = {tuple(r.lrule) for r in pruned.rule_list}
-        df = df[df["lrule"].isin(kept_lrules)].reset_index(drop=True)
+        # Keep DataFrame rows that survived pruning, then align rule_list order to DataFrame order.
+        pruned_by_lrule: Dict[Tuple, CRFuzzyRule] = {tuple(r.lrule): r for r in pruned.rule_list}
+        df = df[df["lrule"].isin(pruned_by_lrule.keys())].reset_index(drop=True)
+        aligned_rules = [pruned_by_lrule[tuple(lr)] for lr in df["lrule"].tolist()]
+        pruned = SetFuzzyRules(aligned_rules)
     return pruned, df
 
 
@@ -853,8 +856,11 @@ def ARFI_beam(
         logger=lg,
     )
     if not df.empty:
-        kept_lrules = {tuple(r.lrule) for r in pruned.rule_list}
-        df = df[df["lrule"].isin(kept_lrules)].reset_index(drop=True)
+        # Keep DataFrame rows that survived pruning, then align rule_list order to DataFrame order.
+        pruned_by_lrule: Dict[Tuple, CRFuzzyRule] = {tuple(r.lrule): r for r in pruned.rule_list}
+        df = df[df["lrule"].isin(pruned_by_lrule.keys())].reset_index(drop=True)
+        aligned_rules = [pruned_by_lrule[tuple(lr)] for lr in df["lrule"].tolist()]
+        pruned = SetFuzzyRules(aligned_rules)
     return pruned, df
 
 
