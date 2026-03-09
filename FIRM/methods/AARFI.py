@@ -1,8 +1,10 @@
 import copy
 import logging
+from collections import defaultdict
 from typing import Dict, List, Tuple, Iterable, Optional, Callable
 import numpy as np
 import pandas as pd
+from joblib import Parallel, delayed
 
 from FIRM.base.ct_fuzzy_rule import CRFuzzyRule
 from FIRM.base.ct_fuzzy_antecedent import CRFuzzyAntecedent
@@ -162,21 +164,29 @@ def generate_nitemsets(
     Ck = set()
     parent_map: Dict[frozenset, Tuple[frozenset, Tuple[int,int]]] = {}
     L = [sorted(s) for s in prev_level]
-    n = len(L)
-    for i in range(n):
-        for j in range(i + 1, n):
-            a, b = L[i], L[j]
-            # join if first k-2 items equal
-            if a[:-1] == b[:-1]:
-                cand = a[:-1] + sorted([a[-1], b[-1]])
+
+    # Group itemsets by their shared prefix (first k-2 items).
+    # Only itemsets within the same prefix group can join, so this avoids
+    # the O(n^2) all-pairs scan — critical when |L_{k-1}| is large (e.g. online_news L2).
+    prefix_groups: Dict[tuple, List[list]] = defaultdict(list)
+    for items in L:
+        prefix_groups[tuple(items[:-1])].append(items)
+
+    for prefix, group in prefix_groups.items():
+        ng = len(group)
+        for i in range(ng):
+            for j in range(i + 1, ng):
+                a, b = group[i], group[j]
+                cand = list(prefix) + sorted([a[-1], b[-1]])
                 # enforce unique feature indices
                 features = [fi for (fi, _) in cand]
                 if len(features) == len(set(features)):
                     cand_fs = frozenset(cand)
-                    Ck.add(cand_fs)
-                    # Incremental vector construction:
-                    # cand = parent + singleton_added_item
-                    parent_map.setdefault(cand_fs, (frozenset(a), b[-1]))
+                    if cand_fs not in Ck:
+                        Ck.add(cand_fs)
+                        # Incremental vector construction:
+                        # cand = parent + singleton_added_item
+                        parent_map[cand_fs] = (frozenset(a), b[-1])
     out = list(Ck)
     _vlog(verbose, lg, "Joined %d -> %d candidates for next level.", len(prev_level), len(out))
     return out, parent_map
@@ -416,6 +426,72 @@ def beam_apriori(
     return selected, ant_vectors
 
 
+# ---------- Per-antecedent worker (shared by AARFI_F and ARFI_beam) -------
+
+def _eval_antecedent(
+    ant: frozenset,
+    ant_vec: np.ndarray,
+    C: np.ndarray,
+    C_f: Optional[np.ndarray],
+    con_feat_idx: np.ndarray,
+    con_items: list,
+    F,
+    separable_F: bool,
+    N: int,
+    chunk_rows: int,
+    min_supp: float,
+    min_conf: float,
+    fuzzy_dataset,
+) -> List[dict]:
+    """Evaluate one antecedent against all compatible consequents. Returns matching row dicts."""
+    a = ant_vec
+    sum_a = float(a.sum()) + 1e-12
+    coverage_a = float(a.mean())
+
+    ant_features = {fi for (fi, _) in ant}
+    compat_idx = np.nonzero(~np.isin(con_feat_idx, list(ant_features)))[0]
+    if compat_idx.size == 0:
+        return []
+
+    n_compat = compat_idx.size
+    numerators_compat = np.zeros(n_compat, dtype=np.float64)
+
+    if separable_F:
+        C_f_compat = C_f[:, compat_idx]
+        for s in range(0, N, chunk_rows):
+            e = min(s + chunk_rows, N)
+            numerators_compat += (a[s:e, None] * C_f_compat[s:e]).sum(axis=0, dtype=np.float64)
+    else:
+        C_compat = C[:, compat_idx]
+        for s in range(0, N, chunk_rows):
+            e = min(s + chunk_rows, N)
+            numerators_compat += F(a[s:e, None], C_compat[s:e]).sum(axis=0, dtype=np.float64)
+
+    fsupport = (numerators_compat / float(N)).astype(np.float32, copy=False)
+    fconf = (numerators_compat / sum_a).astype(np.float32, copy=False)
+
+    ok = (fsupport >= min_supp) & (fconf >= min_conf)
+    if not np.any(ok):
+        return []
+
+    idxs_local = np.nonzero(ok)[0]
+    idxs = compat_idx[idxs_local]
+
+    result = []
+    for pos, j in zip(idxs_local.tolist(), idxs.tolist()):
+        lrule = sorted(ant) + [con_items[j]]
+        r = CRFuzzyRule(lrule)
+        result.append({
+            "rule": r.sentence_rule(fuzzy_dataset),
+            "coverage": coverage_a,
+            "support": float(fsupport[pos]),
+            "confidence": float(fconf[pos]),
+            "lrule": tuple(lrule),
+            "n_antecedents": r.get_num_features(),
+        })
+    return result
+
+
 # ---------- Rule generation (AARFI) ---------------------------------------
 
 def AARFI(
@@ -596,6 +672,9 @@ def AARFI_F(
     max_feat: int = 5,
     chunk_rows: int = 100_000,  # set 0/None to process all rows at once
     prune_epsilon: float = 0.05,
+    separable_F: bool = False,  # set True only when F(x,y) = x*g(y); precomputes g(C) once
+    n_jobs: int = 1,            # parallel workers over antecedents; -1 = all cores (non-separable F only)
+    ant_batch_size: int = 512,  # antecedents per BLAS batch (separable_F=True path)
     verbose: bool = False,
     logger: Optional[logging.Logger] = None,
 ) -> Tuple[SetFuzzyRules, pd.DataFrame]:
@@ -640,63 +719,63 @@ def AARFI_F(
     if not chunk_rows or chunk_rows <= 0:
         chunk_rows = N
 
-    rows = []
-    rule_objs: List[CRFuzzyRule] = []
-    examined_pairs = 0
-    kept_pairs = 0
+    # Optional precomputation: only valid when F(x,y) = x * g(y).
+    # F(1, C) = g(C), so F(a, c) = a * g(c). Avoids recomputing g(C) per antecedent.
+    C_f = F(np.ones((1, Cn), dtype=np.float32), C).astype(np.float32, copy=False) if separable_F else None
 
-    for ant in ant_list:
-        a = ant_vecs[ant].astype(np.float32, copy=False)  # (N,)
-        sum_a = float(a.sum()) + 1e-12
-        coverage_a = float(a.mean())
+    if separable_F:
+        # Batch matrix multiply: numerators[i, j] = dot(A[i], C_f[:, j]) in float64.
+        # Replaces per-antecedent joblib dispatch with a single BLAS dgemm per batch.
+        C_f64 = C_f.astype(np.float64, copy=False)
+        rows = []
+        for bs in range(0, len(ant_list), ant_batch_size):
+            be = min(bs + ant_batch_size, len(ant_list))
+            batch_ants = ant_list[bs:be]
+            M = len(batch_ants)
 
-        # Feature-compatibility mask (structural)
-        ant_features = {fi for (fi, _) in ant}
-        mask_feat = ~np.isin(con_feat_idx, list(ant_features))  # (Cn,)
-        if not np.any(mask_feat):
-            continue
+            A = np.stack([ant_vecs[ant] for ant in batch_ants]).astype(np.float64)  # (M, N)
+            sum_A = A.sum(axis=1)            # (M,)
+            coverage_batch = A.mean(axis=1)  # (M,)
 
-        # Accumulate numerators: n_j = sum_i F(a_i, C_ij), chunked over rows to save RAM
-        numerators = np.zeros(Cn, dtype=np.float64)
-        for s in range(0, N, chunk_rows):
-            e = min(s + chunk_rows, N)
-            a_blk = a[s:e][:, None]       # (B, 1)
-            C_blk = C[s:e, :]             # (B, Cn)
-            blk = F(a_blk, C_blk)         # must broadcast -> (B, Cn)
-            numerators += blk.sum(axis=0, dtype=np.float64)
+            numerators = A @ C_f64           # (M, Cn) — single BLAS dgemm call
+            fsupport = (numerators / N).astype(np.float32)
+            fconf    = (numerators / (sum_A[:, None] + 1e-12)).astype(np.float32)
 
-        fsupport_all = (numerators / float(N)).astype(np.float32, copy=False)  # (Cn,)
-        fconf_all    = (numerators / sum_a).astype(np.float32, copy=False)     # (Cn,)
+            # Compatibility: consequent feature must differ from all antecedent features
+            compat = np.ones((M, Cn), dtype=bool)
+            for i, ant in enumerate(batch_ants):
+                ant_feats = np.fromiter((fi for fi, _ in ant), dtype=np.int32, count=len(ant))
+                compat[i] = ~np.isin(con_feat_idx, ant_feats)
 
-        ok = mask_feat & (fsupport_all >= min_supp) & (fconf_all >= min_conf)
-        examined_pairs += int(mask_feat.sum())
-        if not np.any(ok):
-            continue
+            ok = (fsupport >= min_supp) & (fconf >= min_conf) & compat
+            ant_idxs, con_idxs = np.nonzero(ok)
+            for ai, cj in zip(ant_idxs.tolist(), con_idxs.tolist()):
+                ant = batch_ants[ai]
+                lrule = sorted(ant) + [con_items[cj]]
+                r = CRFuzzyRule(lrule)
+                rows.append({
+                    "rule": r.sentence_rule(fuzzy_dataset),
+                    "coverage": float(coverage_batch[ai]),
+                    "support": float(fsupport[ai, cj]),
+                    "confidence": float(fconf[ai, cj]),
+                    "lrule": tuple(lrule),
+                    "n_antecedents": r.get_num_features(),
+                })
+    else:
+        # Non-separable F: keep per-antecedent evaluation with optional parallelism.
+        batch = Parallel(n_jobs=n_jobs, prefer='threads')(
+            delayed(_eval_antecedent)(
+                ant, ant_vecs[ant].astype(np.float32, copy=False),
+                C, C_f, con_feat_idx, con_items, F, separable_F,
+                N, chunk_rows, min_supp, min_conf, fuzzy_dataset,
+            )
+            for ant in ant_list
+        )
+        rows = [row for ant_rows in batch for row in ant_rows]
 
-        idxs = np.nonzero(ok)[0]
-        # Compute evaluation columns only for kept consequents (small K) for display correctness (optional)
-        # If you don't need per-row eval vectors, this step is unnecessary; we already have the metrics.
-        # evalK = F(a[:, None], C[:, idxs])  # (N, K)  <-- omit to save RAM/time
-
-        for j in idxs.tolist():
-            lrule = sorted(ant) + [con_items[j]]
-            r = CRFuzzyRule(lrule)  # no evaluation; we only need the string
-            rule_str = r.sentence_rule(fuzzy_dataset)
-
-            rows.append({
-                "rule": rule_str,
-                "coverage": coverage_a,
-                "support": float(fsupport_all[j]),
-                "confidence": float(fconf_all[j]),
-                "lrule": tuple(lrule),
-                "n_antecedents": r.get_num_features(),
-            })
-            rule_objs.append(r)
-
-        kept_pairs += len(idxs)
-
-    _vlog(verbose, lg, "AARFI_F finished. Rules kept: %d (from %d examined pairs).",
-          kept_pairs, examined_pairs)
+    rule_objs = [CRFuzzyRule(list(row["lrule"])) for row in rows]
+    _vlog(verbose, lg, "AARFI_F finished. Rules kept: %d (from %d antecedents).",
+          len(rows), len(ant_list))
 
     # Build DataFrame and sort for nicer presentation
     if rows:
@@ -738,6 +817,9 @@ def ARFI_beam(
     chunk_rows: int = 100_000,
     score_fn: Optional[Callable[[float, int], float]] = None,
     prune_epsilon: float = 0.05,
+    separable_F: bool = False,  # set True only when F(x,y) = x*g(y); precomputes g(C) once
+    n_jobs: int = 1,            # parallel workers over antecedents; -1 = all cores (non-separable F only)
+    ant_batch_size: int = 512,  # antecedents per BLAS batch (separable_F=True path)
     verbose: bool = False,
     logger: Optional[logging.Logger] = None,
 ) -> Tuple[SetFuzzyRules, pd.DataFrame]:
@@ -790,56 +872,59 @@ def ARFI_beam(
     if not chunk_rows or chunk_rows <= 0:
         chunk_rows = N
 
-    rows = []
-    rule_objs: List[CRFuzzyRule] = []
-    examined_pairs = 0
-    kept_pairs = 0
+    # Optional precomputation: only valid when F(x,y) = x * g(y).
+    C_f = F(np.ones((1, Cn), dtype=np.float32), C).astype(np.float32, copy=False) if separable_F else None
 
-    for ant in ant_list:
-        a = ant_vecs[ant].astype(np.float32, copy=False)
-        sum_a = float(a.sum()) + 1e-12
-        coverage_a = float(a.mean())
+    if separable_F:
+        # Batch matrix multiply: same optimisation as AARFI_F.
+        C_f64 = C_f.astype(np.float64, copy=False)
+        rows = []
+        for bs in range(0, len(ant_list), ant_batch_size):
+            be = min(bs + ant_batch_size, len(ant_list))
+            batch_ants = ant_list[bs:be]
+            M = len(batch_ants)
 
-        ant_features = {fi for (fi, _) in ant}
-        mask_feat = ~np.isin(con_feat_idx, list(ant_features))
-        if not np.any(mask_feat):
-            continue
+            A = np.stack([ant_vecs[ant] for ant in batch_ants]).astype(np.float64)  # (M, N)
+            sum_A = A.sum(axis=1)
+            coverage_batch = A.mean(axis=1)
 
-        numerators = np.zeros(Cn, dtype=np.float64)
-        for s in range(0, N, chunk_rows):
-            e = min(s + chunk_rows, N)
-            a_blk = a[s:e][:, None]
-            C_blk = C[s:e, :]
-            blk = F(a_blk, C_blk)
-            numerators += blk.sum(axis=0, dtype=np.float64)
+            numerators = A @ C_f64           # (M, Cn)
+            fsupport = (numerators / N).astype(np.float32)
+            fconf    = (numerators / (sum_A[:, None] + 1e-12)).astype(np.float32)
 
-        fsupport_all = (numerators / float(N)).astype(np.float32, copy=False)
-        fconf_all = (numerators / sum_a).astype(np.float32, copy=False)
+            compat = np.ones((M, Cn), dtype=bool)
+            for i, ant in enumerate(batch_ants):
+                ant_feats = np.fromiter((fi for fi, _ in ant), dtype=np.int32, count=len(ant))
+                compat[i] = ~np.isin(con_feat_idx, ant_feats)
 
-        ok = mask_feat & (fsupport_all >= min_supp) & (fconf_all >= min_conf)
-        examined_pairs += int(mask_feat.sum())
-        if not np.any(ok):
-            continue
+            ok = (fsupport >= min_supp) & (fconf >= min_conf) & compat
+            ant_idxs, con_idxs = np.nonzero(ok)
+            for ai, cj in zip(ant_idxs.tolist(), con_idxs.tolist()):
+                ant = batch_ants[ai]
+                lrule = sorted(ant) + [con_items[cj]]
+                r = CRFuzzyRule(lrule)
+                rows.append({
+                    "rule": r.sentence_rule(fuzzy_dataset),
+                    "coverage": float(coverage_batch[ai]),
+                    "support": float(fsupport[ai, cj]),
+                    "confidence": float(fconf[ai, cj]),
+                    "lrule": tuple(lrule),
+                    "n_antecedents": r.get_num_features(),
+                })
+    else:
+        batch = Parallel(n_jobs=n_jobs, prefer='threads')(
+            delayed(_eval_antecedent)(
+                ant, ant_vecs[ant].astype(np.float32, copy=False),
+                C, C_f, con_feat_idx, con_items, F, separable_F,
+                N, chunk_rows, min_supp, min_conf, fuzzy_dataset,
+            )
+            for ant in ant_list
+        )
+        rows = [row for ant_rows in batch for row in ant_rows]
 
-        idxs = np.nonzero(ok)[0]
-        for j in idxs.tolist():
-            lrule = sorted(ant) + [con_items[j]]
-            r = CRFuzzyRule(lrule)
-            rule_str = r.sentence_rule(fuzzy_dataset)
-            rows.append({
-                "rule": rule_str,
-                "coverage": coverage_a,
-                "support": float(fsupport_all[j]),
-                "confidence": float(fconf_all[j]),
-                "lrule": tuple(lrule),
-                "n_antecedents": r.get_num_features(),
-            })
-            rule_objs.append(r)
-
-        kept_pairs += len(idxs)
-
-    _vlog(verbose, lg, "ARFI_beam finished. Rules kept: %d (from %d examined pairs).",
-          kept_pairs, examined_pairs)
+    rule_objs = [CRFuzzyRule(list(row["lrule"])) for row in rows]
+    _vlog(verbose, lg, "ARFI_beam finished. Rules kept: %d (from %d antecedents).",
+          len(rows), len(ant_list))
 
     if rows:
         df = pd.DataFrame(rows)
